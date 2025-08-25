@@ -1,0 +1,32 @@
+#!/bin/bash
+
+# 停止 Node Exporter 服务
+echo "Stopping Node Exporter service..."
+sudo systemctl stop node_exporter
+sudo systemctl disable node_exporter
+
+# 删除 systemd 服务文件
+echo "Removing Node Exporter service file..."
+sudo rm -f /etc/systemd/system/node_exporter.service
+
+# 重新加载 systemd 配置
+echo "Reloading systemd daemon..."
+sudo systemctl daemon-reload
+sudo systemctl reset-failed
+
+# 删除 Node Exporter 二进制文件
+echo "Removing Node Exporter binary..."
+sudo rm -f /usr/local/bin/node_exporter
+
+# 删除 Node Exporter 用户
+echo "Removing Node Exporter user..."
+sudo userdel -r node_exporter 2>/dev/null || echo "No home directory to remove or user already deleted"
+
+# 检查是否有残留文件
+echo "Checking for residual files..."
+find / -name '*node_exporter*' 2>/dev/null | while read -r file; do
+    echo "Found residual file: $file"
+    sudo rm -rf "$file"
+done
+
+echo "Node Exporter has been thoroughly uninstalled."
