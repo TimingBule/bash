@@ -22,11 +22,5 @@ sudo rm -f /usr/local/bin/node_exporter
 echo "Removing Node Exporter user..."
 sudo userdel -r node_exporter 2>/dev/null || echo "No home directory to remove or user already deleted"
 
-# 检查是否有残留文件
-echo "Checking for residual files..."
-find / -name '*node_exporter*' 2>/dev/null | while read -r file; do
-    echo "Found residual file: $file"
-    sudo rm -rf "$file"
-done
 
 echo "Node Exporter has been thoroughly uninstalled."
