@@ -1,0 +1,414 @@
+#!/bin/bash
+
+# IP流量限速脚本 for Debian 11 (修复版)
+# 用法: ./ip-traffic-limiter-fixed.sh [add|remove|list|check] [IP] [流量限制GB] [限速带宽]
+
+INTERFACE="eth0"  # 修改为实际网卡名称
+IPTABLES_CHAIN="IP_TRAFFIC_MONITOR"
+LOG_FILE="/var/log/ip-traffic-limiter.log"
+CONFIG_FILE="/etc/ip-traffic-limits.conf"
+
+# 日志函数
+log_message() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+}
+
+# 创建配置文件
+init_config() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        touch "$CONFIG_FILE"
+        chmod 600 "$CONFIG_FILE"
+    fi
+}
+
+# 初始化iptables规则
+init_iptables() {
+    # 创建专用链
+    if ! iptables -L "$IPTABLES_CHAIN" -n >/dev/null 2>&1; then
+        iptables -N "$IPTABLES_CHAIN"
+        iptables -I INPUT -j "$IPTABLES_CHAIN"
+        iptables -I OUTPUT -j "$IPTABLES_CHAIN"
+        log_message "Created iptables chain: $IPTABLES_CHAIN"
+    fi
+}
+
+# 初始化TC（修复版）
+init_tc() {
+    # 检查是否已有HTB规则，如果没有则创建
+    if ! tc qdisc show dev "$INTERFACE" | grep -q "htb"; then
+        tc qdisc add dev "$INTERFACE" root handle 1: htb default 999
+        tc class add dev "$INTERFACE" parent 1: classid 1:1 htb rate 1000mbit
+        # 默认类（无限制）
+        tc class add dev "$INTERFACE" parent 1:1 classid 1:999 htb rate 1000mbit ceil 1000mbit
+        log_message "Initialized HTB qdisc on $INTERFACE"
+    fi
+}
+
+# 获取IP流量使用情况（字节）
+get_ip_traffic() {
+    local ip=$1
+    local bytes_in=$(iptables -L "$IPTABLES_CHAIN" -n -v -x | grep "$ip" | grep " 0.0.0.0/0 " | awk '{sum+=$2} END {print sum+0}')
+    local bytes_out=$(iptables -L "$IPTABLES_CHAIN" -n -v -x | grep " 0.0.0.0/0 " | grep "$ip" | awk '{sum+=$2} END {print sum+0}')
+    echo $((bytes_in + bytes_out))
+}
+
+# 添加IP监控和限制
+add_ip_limit() {
+    local ip=$1
+    local limit_gb=$2
+    local speed_limit=${3:-"10mbit"}
+    
+    if [ -z "$ip" ] || [ -z "$limit_gb" ]; then
+        echo "用法: $0 add <IP地址> <流量限制GB> [限速带宽]"
+        return 1
+    fi
+    
+    # 验证IP格式
+    if ! echo "$ip" | grep -qE '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$'; then
+        echo "错误: 无效的IP地址格式"
+        return 1
+    fi
+    
+    # 检查IP是否已存在
+    if grep -q "^$ip:" "$CONFIG_FILE"; then
+        echo "IP $ip 已存在，请先删除或直接修改配置文件"
+        return 1
+    fi
+    
+    # 初始化环境
+    init_iptables
+    init_tc
+    
+    # 添加iptables规则进行流量统计
+    iptables -A "$IPTABLES_CHAIN" -s "$ip" -j ACCEPT
+    iptables -A "$IPTABLES_CHAIN" -d "$ip" -j ACCEPT
+    
+    # 保存配置
+    echo "$ip:$limit_gb:$speed_limit:$(date +%s)" >> "$CONFIG_FILE"
+    
+    log_message "Added IP limit: $ip -> ${limit_gb}GB, speed limit: $speed_limit"
+    echo "已添加IP限制: $ip (限制: ${limit_gb}GB, 限速: $speed_limit)"
+}
+
+# 移除IP限制
+remove_ip_limit() {
+    local ip=$1
+    
+    if [ -z "$ip" ]; then
+        echo "用法: $0 remove <IP地址>"
+        return 1
+    fi
+    
+    # 从iptables移除规则
+    iptables -D "$IPTABLES_CHAIN" -s "$ip" -j ACCEPT 2>/dev/null || true
+    iptables -D "$IPTABLES_CHAIN" -d "$ip" -j ACCEPT 2>/dev/null || true
+    
+    # 从TC移除限制
+    remove_speed_limit "$ip"
+    
+    # 从配置文件移除
+    sed -i "/^$ip:/d" "$CONFIG_FILE"
+    
+    log_message "Removed IP limit: $ip"
+    echo "已移除IP限制: $ip"
+}
+
+# 获取TC类ID
+get_tc_class_id() {
+    local ip=$1
+    # 简单的IP到类ID映射（避免冲突）
+    echo "$ip" | tr '.' ' ' | awk '{print ($1*1000 + $2*100 + $3*10 + $4) % 900 + 100}'
+}
+
+# 应用限速（修复版）
+apply_speed_limit() {
+    local ip=$1
+    local speed_limit=$2
+    local class_id=$(get_tc_class_id "$ip")
+    
+    log_message "Applying speed limit to $ip: $speed_limit (class: 1:$class_id)"
+    
+    # 1. 删除可能存在的旧规则
+    tc class del dev "$INTERFACE" classid "1:$class_id" 2>/dev/null || true
+    tc qdisc del dev "$INTERFACE" parent "1:$class_id" 2>/dev/null || true
+    
+    # 2. 清理该IP相关的所有filter规则
+    clean_ip_filters "$ip"
+    
+    # 3. 创建限速类
+    tc class add dev "$INTERFACE" parent 1:1 classid "1:$class_id" htb rate "$speed_limit" ceil "$speed_limit"
+    
+    # 4. 添加叶子qdisc（关键步骤！）
+    tc qdisc add dev "$INTERFACE" parent "1:$class_id" handle "$class_id:" sfq perturb 10
+    
+    # 5. 添加过滤器规则
+    tc filter add dev "$INTERFACE" protocol ip parent 1:0 prio 1 u32 match ip dst "$ip" flowid "1:$class_id"
+    tc filter add dev "$INTERFACE" protocol ip parent 1:0 prio 1 u32 match ip src "$ip" flowid "1:$class_id"
+    
+    log_message "Successfully applied speed limit to $ip: $speed_limit"
+}
+
+# 清理IP相关的filter规则
+clean_ip_filters() {
+    local ip=$1
+    local ip_hex=$(python3 -c "import ipaddress; print(format(int(ipaddress.IPv4Address('$ip')), '08x'))" 2>/dev/null)
+    
+    if [ -z "$ip_hex" ]; then
+        # 如果没有python3，使用备用方法
+        local a b c d
+        IFS='.' read -r a b c d <<< "$ip"
+        ip_hex=$(printf "%02x%02x%02x%02x" "$a" "$b" "$c" "$d")
+    fi
+    
+    # 获取所有包含该IP的filter句柄
+    local filter_handles=$(tc filter show dev "$INTERFACE" | grep -B5 -A5 "$ip_hex" | grep "fh" | awk '{print $NF}' | sort -u)
+    
+    # 删除相关的filter规则
+    for handle in $filter_handles; do
+        tc filter del dev "$INTERFACE" protocol ip parent 1:0 prio 1 handle "$handle" u32 2>/dev/null || true
+    done
+}
+
+# 移除限速
+remove_speed_limit() {
+    local ip=$1
+    local class_id=$(get_tc_class_id "$ip")
+    
+    # 清理filter规则
+    clean_ip_filters "$ip"
+    
+    # 删除叶子qdisc
+    tc qdisc del dev "$INTERFACE" parent "1:$class_id" 2>/dev/null || true
+    
+    # 删除限速类
+    tc class del dev "$INTERFACE" classid "1:$class_id" 2>/dev/null || true
+    
+    log_message "Removed speed limit from $ip"
+}
+
+# 检查所有IP的流量使用情况
+check_all_ips() {
+    if [ ! -f "$CONFIG_FILE" ] || [ ! -s "$CONFIG_FILE" ]; then
+        echo "没有配置IP限制"
+        return 0
+    fi
+    
+    echo "=== IP流量使用情况 ==="
+    printf "%-15s %-10s %-15s %-10s %-15s\n" "IP地址" "已用流量" "限制流量" "使用率" "状态"
+    echo "----------------------------------------------------------------"
+    
+    while IFS=':' read -r ip limit_gb speed_limit start_time; do
+        [ -z "$ip" ] && continue
+        
+        local current_bytes=$(get_ip_traffic "$ip")
+        local current_gb=$((current_bytes / 1024 / 1024 / 1024))
+        local limit_bytes=$((limit_gb * 1024 * 1024 * 1024))
+        local usage_percent=0
+        
+        if [ "$limit_bytes" -gt 0 ]; then
+            usage_percent=$((current_bytes * 100 / limit_bytes))
+        fi
+        
+        local status="正常"
+        local class_id=$(get_tc_class_id "$ip")
+        local is_limited=$(tc class show dev "$INTERFACE" classid "1:$class_id" 2>/dev/null)
+        
+        if [ "$current_bytes" -gt "$limit_bytes" ]; then
+            if [ -z "$is_limited" ]; then
+                # 需要应用限速
+                apply_speed_limit "$ip" "$speed_limit"
+                status="已限速"
+            else
+                status="已限速"
+            fi
+        else
+            if [ -n "$is_limited" ]; then
+                # 需要移除限速
+                remove_speed_limit "$ip"
+                status="正常"
+            else
+                status="正常"
+            fi
+        fi
+        
+        printf "%-15s %-10s %-15s %-10s %-15s\n" "$ip" "${current_gb}GB" "${limit_gb}GB" "${usage_percent}%" "$status"
+        
+    done < "$CONFIG_FILE"
+}
+
+# 列出所有配置的IP
+list_ips() {
+    if [ ! -f "$CONFIG_FILE" ] || [ ! -s "$CONFIG_FILE" ]; then
+        echo "没有配置IP限制"
+        return 0
+    fi
+    
+    echo "=== 配置的IP限制列表 ==="
+    printf "%-15s %-10s %-15s %-10s\n" "IP地址" "流量限制" "限速带宽" "当前状态"
+    echo "---------------------------------------------------"
+    
+    while IFS=':' read -r ip limit_gb speed_limit start_time; do
+        [ -z "$ip" ] && continue
+        
+        local class_id=$(get_tc_class_id "$ip")
+        local status="未限速"
+        if tc class show dev "$INTERFACE" classid "1:$class_id" >/dev/null 2>&1; then
+            status="限速中"
+        fi
+        
+        printf "%-15s %-10s %-15s %-10s\n" "$ip" "${limit_gb}GB" "$speed_limit" "$status"
+    done < "$CONFIG_FILE"
+}
+
+# 显示TC状态
+show_tc_status() {
+    echo "=== TC配置状态 ==="
+    echo "Queue disciplines:"
+    tc qdisc show dev "$INTERFACE"
+    echo ""
+    echo "Classes:"
+    tc class show dev "$INTERFACE"
+    echo ""
+    echo "Filters:"
+    tc filter show dev "$INTERFACE"
+}
+
+# 显示帮助信息
+show_help() {
+    echo "IP流量限速工具 - Debian 11 (修复版)"
+    echo ""
+    echo "用法:"
+    echo "  $0 add <IP> <流量限制GB> [限速带宽]     - 添加IP流量限制"
+    echo "  $0 remove <IP>                        - 移除IP流量限制"  
+    echo "  $0 check                             - 检查所有IP流量并应用限制"
+    echo "  $0 list                              - 列出所有配置的IP"
+    echo "  $0 status                            - 显示TC配置状态"
+    echo "  $0 reset                             - 重置所有限制"
+    echo "  $0 clean                             - 清理无效的TC规则"
+    echo ""
+    echo "示例:"
+    echo "  $0 add 18.183.231.64 1 1mbit          - 限制IP流量1GB，超限后限速至1Mbps"
+    echo "  $0 remove 18.183.231.64              - 移除该IP的限制"
+    echo "  $0 check                             - 检查并应用所有限制"
+}
+
+# 清理无效的TC规则
+clean_tc_rules() {
+    log_message "Cleaning invalid TC rules..."
+    
+    # 获取所有配置中的IP
+    local configured_ips=()
+    if [ -f "$CONFIG_FILE" ]; then
+        while IFS=':' read -r ip limit_gb speed_limit start_time; do
+            [ -z "$ip" ] && continue
+            configured_ips+=("$ip")
+        done < "$CONFIG_FILE"
+    fi
+    
+    # 获取所有TC中的类
+    local tc_classes=$(tc class show dev "$INTERFACE" | grep -E "class htb 1:[0-9]+" | grep -v "1:1\|1:999" | awk '{print $3}' | cut -d: -f2)
+    
+    for class_id in $tc_classes; do
+        local ip_found=false
+        for configured_ip in "${configured_ips[@]}"; do
+            if [ "$class_id" -eq "$(get_tc_class_id "$configured_ip")" ]; then
+                ip_found=true
+                break
+            fi
+        done
+        
+        if [ "$ip_found" = false ]; then
+            echo "清理无效类: 1:$class_id"
+            tc qdisc del dev "$INTERFACE" parent "1:$class_id" 2>/dev/null || true
+            tc class del dev "$INTERFACE" classid "1:$class_id" 2>/dev/null || true
+        fi
+    done
+    
+    # 清理所有filter规则并重新创建
+    tc filter del dev "$INTERFACE" protocol ip parent 1:0 prio 1 2>/dev/null || true
+    
+    # 为所有当前限速的IP重新创建filter规则
+    for configured_ip in "${configured_ips[@]}"; do
+        local class_id=$(get_tc_class_id "$configured_ip")
+        if tc class show dev "$INTERFACE" classid "1:$class_id" >/dev/null 2>&1; then
+            tc filter add dev "$INTERFACE" protocol ip parent 1:0 prio 1 u32 match ip dst "$configured_ip" flowid "1:$class_id"
+            tc filter add dev "$INTERFACE" protocol ip parent 1:0 prio 1 u32 match ip src "$configured_ip" flowid "1:$class_id"
+            echo "重建filter规则: $configured_ip -> 1:$class_id"
+        fi
+    done
+    
+    log_message "TC rules cleanup completed"
+    echo "TC规则清理完成"
+}
+
+# 重置所有限制
+reset_all() {
+    # 清空iptables链
+    if iptables -L "$IPTABLES_CHAIN" -n >/dev/null 2>&1; then
+        iptables -F "$IPTABLES_CHAIN"
+    fi
+    
+    # 重置TC
+    tc qdisc del dev "$INTERFACE" root 2>/dev/null || true
+    
+    # 清空配置文件
+    > "$CONFIG_FILE"
+    
+    log_message "Reset all IP limits"
+    echo "已重置所有IP限制"
+}
+
+# 检查网卡
+check_interface() {
+    if ! ip link show "$INTERFACE" &>/dev/null; then
+        echo "错误: 网卡 $INTERFACE 不存在"
+        echo "可用网卡列表:"
+        ip link show | grep -E '^[0-9]+:' | awk -F': ' '{print $2}' | grep -v lo
+        exit 1
+    fi
+}
+
+# 主程序
+main() {
+    # 检查权限
+    if [ "$EUID" -ne 0 ]; then
+        echo "请使用root权限运行此脚本"
+        exit 1
+    fi
+    
+    # 检查网卡
+    check_interface
+    
+    # 初始化配置
+    init_config
+    
+    case "$1" in
+        "add")
+            add_ip_limit "$2" "$3" "$4"
+            ;;
+        "remove")
+            remove_ip_limit "$2"
+            ;;
+        "check")
+            check_all_ips
+            ;;
+        "list")
+            list_ips
+            ;;
+        "status")
+            show_tc_status
+            ;;
+        "clean")
+            clean_tc_rules
+            ;;
+        "reset")
+            reset_all
+            ;;
+        *)
+            show_help
+            ;;
+    esac
+}
+
+# 运行主程序
+main "$@"
