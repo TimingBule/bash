@@ -13,3 +13,19 @@ wget 拉取 GitHub API，解析最新版本号并下载。
 兼容 systemd 服务
 
 运行 systemctl enable --now node_exporter，确保 node_exporter 在系统启动时自动运行。
+
+
+
+IPlimit-1
+# 1. 复制脚本
+sudo cp ifb-traffic-limiter.sh /usr/local/bin/
+sudo chmod +x /usr/local/bin/ifb-traffic-limiter.sh
+
+# 2. 设置双向限速
+sudo /usr/local/bin/ifb-traffic-limiter.sh setup
+
+# 3. 测试效果
+sudo /usr/local/bin/ifb-traffic-limiter.sh test
+
+# 4. 查看实时统计
+sudo /usr/local/bin/ifb-traffic-limiter.sh stats
