@@ -15,15 +15,38 @@ echo "Latest version tag: ${tag}"
 version=${tag#*v}
 echo "Version: $version"
 
+# 检测系统架构
+arch=$(uname -m)
+case "$arch" in
+  x86_64)
+    arch_str="amd64"
+    ;;
+  aarch64 | arm64)
+    arch_str="arm64"
+    ;;
+  armv7l)
+    arch_str="armv7"
+    ;;
+  armv6l)
+    arch_str="armv6"
+    ;;
+  *)
+    echo "ERROR: 不支持的架构: $arch"
+    exit 1
+    ;;
+esac
+echo "System arch: ${arch} → ${arch_str}"
+
 # 下载并安装
-wget https://github.com/prometheus/node_exporter/releases/download/${tag}/node_exporter-${version}.linux-amd64.tar.gz
-tar xvfz node_exporter-${version}.linux-amd64.tar.gz
-rm node_exporter-${version}.linux-amd64.tar.gz
+pkg_name="node_exporter-${version}.linux-${arch_str}"
+wget "https://github.com/prometheus/node_exporter/releases/download/${tag}/${pkg_name}.tar.gz"
+tar xvfz "${pkg_name}.tar.gz"
+rm "${pkg_name}.tar.gz"
 
 # 停止旧服务再替换二进制
 sudo systemctl stop node_exporter 2>/dev/null || true
-sudo mv node_exporter-${version}.linux-amd64/node_exporter /usr/local/bin
-rm -rf node_exporter-${version}.linux-amd64
+sudo mv "${pkg_name}/node_exporter" /usr/local/bin
+rm -rf "${pkg_name}"
 
 # 创建用户（已存在则跳过）
 sudo useradd -rs /bin/false node_exporter 2>/dev/null || true
