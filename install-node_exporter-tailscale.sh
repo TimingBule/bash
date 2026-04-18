@@ -36,8 +36,11 @@ Group=node_exporter
 Type=simple
 Restart=on-failure
 RestartSec=5s
-ExecStart=/usr/local/bin/node_exporter --web.listen-address=${tailscale_ip}:9100
-
+ExecStart=/usr/local/bin/node_exporter \
+  --web.listen-address=${tailscale_ip}:9100 \
+  --collector.netdev.device-exclude="^(docker[0-9]+|br-[a-f0-9]+|veth[a-f0-9]+|lo)$" \
+  --collector.filesystem.mount-points-exclude="^/(sys|proc|dev|host|etc|run/docker.+)($|/)" \
+  --collector.filesystem.fs-types-exclude="^(tmpfs|overlay|aufs|nsfs|squashfs|fuse.lxcfs)$"
 [Install]
 WantedBy=multi-user.target
 EOF
